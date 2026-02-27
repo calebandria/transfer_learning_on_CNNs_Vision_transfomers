@@ -427,7 +427,17 @@ def run_transformer_comparison(
         if skip_trained and ckpt_file.exists():
             logger.info("[%s] Checkpoint found – skipping retraining.", display_name)
             try:
-                saved = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+                load_kwargs: dict = {"map_location": "cpu"}
+                # weights_only=True is the safe default (avoids arbitrary code
+                # execution via pickle).  The parameter is available since
+                # PyTorch 1.13; strip build metadata (e.g. '+cu118') before
+                # parsing to handle all version string formats.
+                _torch_ver = tuple(
+                    int(x) for x in torch.__version__.split("+")[0].split(".")[:2]
+                )
+                if _torch_ver >= (1, 13):
+                    load_kwargs["weights_only"] = True
+                saved = torch.load(ckpt_file, **load_kwargs)
                 best_state = saved.get("best_state")
                 if best_state is None:
                     raise ValueError("Checkpoint contains no best_state.")
@@ -551,9 +561,12 @@ def run_transformer_comparison(
             best_model.to(run_device)
 
             # ---- Persist checkpoint ----
+            # Store metrics and weights separately so callers can load just the
+            # metrics without deserialising the full state_dict.
+            history_metrics = {k: v for k, v in history.items() if k != "best_state"}
             torch.save(
                 {
-                    "history": {k: v for k, v in history.items() if k != "best_state"},
+                    "history": history_metrics,
                     "best_state": history["best_state"],
                 },
                 ckpt_file,
@@ -573,7 +586,9 @@ def run_transformer_comparison(
 
         finally:
             # ---- Explicit cleanup: free GPU memory between models ----
-            del train_loader, val_loader
+            # Variables are initialised to None above the try block, so these
+            # deletes are safe even when an exception occurred before assignment.
+            del train_loader, val_loader, test_loader
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
