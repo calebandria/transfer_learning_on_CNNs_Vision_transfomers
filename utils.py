@@ -264,87 +264,6 @@ class EarlyStopping:
                 self.should_stop = True
 
 
-def load_checkpoint_safe(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer | None,
-    checkpoint_path: str | Path,
-    device: torch.device | None = None,
-) -> int:
-    """
-    Safely load a checkpoint with validation.
-
-    Loads the model state dict unconditionally and attempts to load the
-    optimizer state dict, falling back gracefully when the saved parameter
-    groups don't match the current optimizer (e.g. after architecture
-    changes or when resuming with a different set of trainable parameters).
-
-    Parameters
-    ----------
-    model : nn.Module
-        The model to load weights into.
-    optimizer : torch.optim.Optimizer or None
-        The optimizer to restore state into.  Pass ``None`` to skip.
-    checkpoint_path : str or Path
-        Path to the ``.pth`` checkpoint file.
-    device : torch.device, optional
-        Device used for ``map_location`` when loading.  Defaults to the
-        device of the model's first parameter.
-
-    Returns
-    -------
-    int
-        The epoch to resume from (``checkpoint['epoch'] + 1``), or ``0``
-        if no checkpoint was found.
-    """
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        logger.info("No checkpoint found at %s", checkpoint_path)
-        return 0
-
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except StopIteration:
-            device = torch.device("cpu")
-
-    logger.info("Loading checkpoint from %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    # Load model weights
-    try:
-        model.load_state_dict(checkpoint["model_state"])
-        logger.info("✓ Model state loaded successfully")
-    except Exception as e:
-        logger.error("✗ Error loading model state: %s", e)
-        return 0
-
-    # Load optimizer state with mismatch protection
-    if optimizer is not None and "optimizer_state" in checkpoint:
-        try:
-            saved_groups = checkpoint["optimizer_state"]["param_groups"]
-            current_groups = optimizer.param_groups
-            if len(saved_groups) != len(current_groups):
-                logger.warning(
-                    "⚠ Optimizer param groups mismatch (%d saved vs %d current) – "
-                    "skipping optimizer state loading",
-                    len(saved_groups), len(current_groups),
-                )
-            else:
-                optimizer.load_state_dict(checkpoint["optimizer_state"])
-                logger.info("✓ Optimizer state loaded successfully")
-        except (ValueError, KeyError) as e:
-            # ValueError: param group size mismatch detected by PyTorch internally.
-            # KeyError: checkpoint is missing expected optimizer state keys.
-            logger.warning(
-                "⚠ Could not load optimizer state: %s – "
-                "continuing with fresh optimizer state", e,
-            )
-
-    start_epoch = checkpoint.get("epoch", 0) + 1
-    logger.info("Resuming from epoch %d", start_epoch)
-    return start_epoch
-
-
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -358,18 +277,9 @@ def train_model(
     checkpoint_dir: str | Path = "checkpoints",
     device: torch.device | None = None,
     resume_checkpoint: str | Path | None = None,
-    load_optimizer_state: bool = True,
 ) -> dict:
     """
     Train *model* with the given loaders and return a history dictionary.
-
-    Parameters
-    ----------
-    load_optimizer_state : bool
-        When *True* (default) and a ``resume_checkpoint`` is provided, the
-        optimizer state is restored from the checkpoint.  Set to *False* to
-        start with a fresh optimizer even when resuming (useful after changing
-        the model architecture or trainable layers).
 
     Returns
     -------
@@ -401,16 +311,13 @@ def train_model(
     best_weights = copy.deepcopy(model.state_dict())
 
     # Optionally resume from checkpoint
-    if resume_checkpoint is not None:
-        _optimizer_to_restore = optimizer if load_optimizer_state else None
-        start_epoch = load_checkpoint_safe(
-            model, _optimizer_to_restore, resume_checkpoint, device=device
-        )
-        # Restore best_val_acc from checkpoint to avoid overwriting a better
-        # checkpoint in the first epoch of the resumed run.
-        if start_epoch > 0 and Path(resume_checkpoint).exists():
-            _ckpt = torch.load(resume_checkpoint, map_location=device)
-            best_val_acc = _ckpt.get("best_val_acc", 0.0)
+    if resume_checkpoint is not None and Path(resume_checkpoint).exists():
+        ckpt = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val_acc = ckpt.get("best_val_acc", 0.0)
+        logger.info("Resumed from %s (epoch %d)", resume_checkpoint, start_epoch)
 
     history: dict = {
         "train_loss": [], "val_loss": [],
