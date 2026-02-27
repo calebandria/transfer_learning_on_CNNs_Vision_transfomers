@@ -312,7 +312,7 @@ def train_model(
 
     # Optionally resume from checkpoint
     if resume_checkpoint is not None and Path(resume_checkpoint).exists():
-        ckpt = torch.load(resume_checkpoint, map_location=device)
+        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
