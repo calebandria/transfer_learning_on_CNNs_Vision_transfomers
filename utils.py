@@ -3,7 +3,8 @@ utils.py - Utility functions for the transfer-learning comparison framework.
 
 Covers:
   - Data loading and augmentation for Caltech-256
-  - Training loop with early stopping & checkpointing
+  - Training loop with early stopping & checkpointing (CNNs / ViT)
+  - Transformer fine-tuning loop (BERT, RoBERTa, DeBERTa)
   - Evaluation (top-1 / top-5 accuracy, inference time, per-class metrics)
   - Visualization helpers (loss/accuracy curves, comparison plots, confusion matrix)
   - CSV summary export
@@ -17,7 +18,7 @@ import copy
 import random
 import logging
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    f1_score, precision_score, recall_score,
+)
 from tqdm.auto import tqdm
 
 import matplotlib
@@ -736,3 +740,262 @@ def plot_confusion_matrix(
     fig.savefig(out, dpi=100)
     plt.close(fig)
     logger.info("Saved confusion matrix → %s", out)
+
+
+# ---------------------------------------------------------------------------
+# Transformer Training (BERT / RoBERTa / DeBERTa)
+# ---------------------------------------------------------------------------
+
+
+def compute_metrics_from_preds(
+    preds: "np.ndarray",
+    labels: "np.ndarray",
+) -> Dict[str, float]:
+    """Compute accuracy, F1 (macro & weighted), precision and recall."""
+    return {
+        "accuracy":           accuracy_score(labels, preds),
+        "f1_macro":           f1_score(labels, preds, average="macro",    zero_division=0),
+        "f1_weighted":        f1_score(labels, preds, average="weighted", zero_division=0),
+        "precision_macro":    precision_score(labels, preds, average="macro",    zero_division=0),
+        "precision_weighted": precision_score(labels, preds, average="weighted", zero_division=0),
+        "recall_macro":       recall_score(labels, preds, average="macro",    zero_division=0),
+        "recall_weighted":    recall_score(labels, preds, average="weighted", zero_division=0),
+    }
+
+
+def evaluate_loader(
+    model: "torch.nn.Module",
+    loader: DataLoader,
+    device: "torch.device",
+) -> "Tuple[float, Dict[str, float], np.ndarray, np.ndarray]":
+    """
+    Run *model* on *loader* and return
+    ``(avg_loss, metrics_dict, all_preds, all_labels)``.
+    """
+    model.eval()
+    total_loss = 0.0
+    all_preds: List[int] = []
+    all_labels: List[int] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            total_loss += outputs.loss.item()
+            preds = outputs.logits.argmax(dim=-1).cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_labels.extend(batch["labels"].cpu().numpy().tolist())
+
+    avg_loss = total_loss / len(loader)
+    metrics = compute_metrics_from_preds(np.array(all_preds), np.array(all_labels))
+    return avg_loss, metrics, np.array(all_preds), np.array(all_labels)
+
+
+def train_transformer(
+    model_name: str,
+    model_display: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    num_classes: int,
+    config: dict,
+    device: "torch.device",
+) -> Dict:
+    """
+    Unified fine-tuning function for BERT, RoBERTa, and DeBERTa.
+
+    Parameters
+    ----------
+    model_name     : HuggingFace model identifier
+    model_display  : Human-readable name for logging
+    train_loader   : Training DataLoader (already tokenised for this model)
+    val_loader     : Validation DataLoader
+    num_classes    : Number of output classes
+    config         : CONFIG dict (keys: ``num_epochs``, ``learning_rate``,
+                     ``warmup_ratio``, ``weight_decay``, ``gradient_clip``,
+                     ``fp16``, ``patience``, ``checkpoint_dir``)
+    device         : torch.device
+
+    Returns
+    -------
+    dict with training history and the best model state dict.
+    Keys: ``train_loss``, ``val_loss``, ``train_f1``, ``val_f1``,
+    ``train_acc``, ``val_acc``, ``epoch_times``, ``total_time``,
+    ``best_val_f1``, ``model_display``, ``best_state``.
+    """
+    # Lazy imports so that utils.py can be used without the transformers
+    # package when only the CNN / ViT notebook is being run.
+    try:
+        from transformers import (
+            AutoModelForSequenceClassification,
+            get_linear_schedule_with_warmup,
+        )
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "The 'transformers' package is required for train_transformer. "
+            "Install it with:  pip install transformers"
+        ) from exc
+
+    logger.info(
+        "\n%s\n  Training: %s  (%s)\n%s",
+        "=" * 60, model_display, model_name, "=" * 60,
+    )
+
+    # ── Load model
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=num_classes, ignore_mismatched_sizes=True,
+    )
+    model.to(device)
+
+    # ── Optimiser: AdamW with weight decay on non-bias/norm params
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
+    param_groups = [
+        {
+            "params": [p for n, p in model.named_parameters()
+                       if not any(nd in n for nd in no_decay)],
+            "weight_decay": config["weight_decay"],
+        },
+        {
+            "params": [p for n, p in model.named_parameters()
+                       if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=config["learning_rate"])
+
+    # ── Learning-rate schedule: linear warmup + linear decay
+    total_steps = len(train_loader) * config["num_epochs"]
+    warmup_steps = int(total_steps * config["warmup_ratio"])
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+    # ── Mixed precision (GPU only)
+    # DeBERTa-v3: disable fp16 (known instability) and use a smaller LR
+    # per the DeBERTa-v3 paper (He et al., 2021) which recommends 1e-5.
+    use_fp16 = config["fp16"] and device.type == "cuda"
+    if "deberta-v3" in model_name.lower():
+        use_fp16 = False
+        deberta_lr = min(config["learning_rate"], 1e-5)
+        if deberta_lr < config["learning_rate"]:
+            logger.info(
+                "[%s] Using DeBERTa-v3 learning rate: %.0e",
+                model_display, deberta_lr,
+            )
+            optimizer = torch.optim.AdamW(param_groups, lr=deberta_lr)
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+
+    # ── Training state
+    history: Dict = {
+        "train_loss": [], "val_loss": [],
+        "train_f1": [],   "val_f1": [],
+        "train_acc": [],  "val_acc": [],
+        "epoch_times": [],
+    }
+    best_val_f1 = -1.0
+    best_state = None
+    patience_counter = 0
+    ckpt_dir = Path(config["checkpoint_dir"])
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"{model_display.replace('/', '_')}_best.pt"
+
+    train_start = time.time()
+
+    for epoch in range(config["num_epochs"]):
+        epoch_start = time.time()
+        model.train()
+        total_loss = 0.0
+        all_preds: List[int] = []
+        all_labels_ep: List[int] = []
+
+        for batch in tqdm(
+            train_loader,
+            desc=f"[{model_display}] Epoch {epoch + 1}/{config['num_epochs']}",
+            leave=False,
+        ):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            optimizer.zero_grad()
+
+            if use_fp16:
+                with torch.cuda.amp.autocast():
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config["gradient_clip"]
+                )
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config["gradient_clip"]
+                )
+                optimizer.step()
+            scheduler.step()
+
+            total_loss += loss.item()
+            preds = outputs.logits.detach().argmax(dim=-1).cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_labels_ep.extend(batch["labels"].cpu().numpy().tolist())
+
+        train_loss = total_loss / len(train_loader)
+        train_metrics = compute_metrics_from_preds(
+            np.array(all_preds), np.array(all_labels_ep)
+        )
+        val_loss, val_metrics, _, _ = evaluate_loader(model, val_loader, device)
+        epoch_time = time.time() - epoch_start
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_f1"].append(train_metrics["f1_weighted"])
+        history["val_f1"].append(val_metrics["f1_weighted"])
+        history["train_acc"].append(train_metrics["accuracy"])
+        history["val_acc"].append(val_metrics["accuracy"])
+        history["epoch_times"].append(epoch_time)
+
+        logger.info(
+            "[%s] Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  "
+            "train_f1=%.4f  val_f1=%.4f  val_acc=%.4f  time=%.1fs",
+            model_display, epoch + 1, config["num_epochs"],
+            train_loss, val_loss,
+            train_metrics["f1_weighted"], val_metrics["f1_weighted"],
+            val_metrics["accuracy"], epoch_time,
+        )
+
+        # ── Checkpoint best model
+        if val_metrics["f1_weighted"] > best_val_f1:
+            best_val_f1 = val_metrics["f1_weighted"]
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save(best_state, ckpt_path)
+            patience_counter = 0
+            logger.info(
+                "  ✓ New best val_f1=%.4f – checkpoint saved to %s",
+                best_val_f1, ckpt_path,
+            )
+        else:
+            patience_counter += 1
+            if patience_counter >= config["patience"]:
+                logger.info("  Early stopping triggered at epoch %d.", epoch + 1)
+                break
+
+    total_time = time.time() - train_start
+    history["total_time"] = total_time
+    history["best_val_f1"] = best_val_f1
+    history["model_display"] = model_display
+    history["best_state"] = best_state
+
+    logger.info(
+        "[%s] Training complete in %.1fs  best_val_f1=%.4f",
+        model_display, total_time, best_val_f1,
+    )
+    return history
