@@ -40,7 +40,11 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 try:
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    from transformers import (
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
+        get_linear_schedule_with_warmup,
+    )
 
     _TRANSFORMERS_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -64,6 +68,9 @@ CONFIG: dict = {
     "num_epochs": 3,
     "lr": 2e-5,
     "seed": 42,
+    "warmup_ratio": 0.1,
+    "gradient_clip": 1.0,
+    "weight_decay": 0.01,
 }
 
 #: Default number of output classes.
@@ -202,7 +209,9 @@ def train_transformer(
         Number of output classes.
     config : dict
         Training configuration.  Recognised keys: ``num_epochs`` (int),
-        ``lr`` (float).
+        ``lr`` (float), ``warmup_ratio`` (float, default 0.1),
+        ``gradient_clip`` (float, default 1.0),
+        ``weight_decay`` (float, default 0.01).
     device : torch.device
         Device on which to run training.
     cache_dir : str, optional
@@ -225,6 +234,9 @@ def train_transformer(
 
     num_epochs: int = config.get("num_epochs", 3)
     lr: float = config.get("lr", 2e-5)
+    warmup_ratio: float = config.get("warmup_ratio", 0.1)
+    gradient_clip: float = config.get("gradient_clip", 1.0)
+    weight_decay: float = config.get("weight_decay", 0.01)
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
@@ -234,8 +246,34 @@ def train_transformer(
     )
     model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    # Separate parameters: no weight decay for LayerNorm and biases
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
+    param_groups = [
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=lr)
+
+    # Linear warmup + linear decay schedule
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
 
     history: dict = {
         "train_loss": [],
@@ -257,15 +295,25 @@ def train_transformer(
             desc=f"[{model_display}] Epoch {epoch}/{num_epochs}",
             leave=False,
         ):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            # Pass all tokenizer outputs (input_ids, attention_mask,
+            # token_type_ids if present) plus labels to the model so that
+            # the model computes the loss internally.  This is important for
+            # DeBERTa-v3 which uses its own loss path.
             labels = batch["labels"].to(device)
+            model_inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if k != "labels"
+            }
 
             optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs.logits, labels)
+            outputs = model(**model_inputs, labels=labels)
+            loss = outputs.loss
             loss.backward()
+            # Gradient clipping is critical for DeBERTa-v3 stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
+            scheduler.step()
 
             running_loss += loss.item() * labels.size(0)
             n_train += labels.size(0)
@@ -280,13 +328,15 @@ def train_transformer(
 
         with torch.no_grad():
             for batch in val_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
+                model_inputs = {
+                    k: v.to(device)
+                    for k, v in batch.items()
+                    if k != "labels"
+                }
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = criterion(outputs.logits, labels)
-                val_loss_sum += loss.item() * labels.size(0)
+                outputs = model(**model_inputs, labels=labels)
+                val_loss_sum += outputs.loss.item() * labels.size(0)
                 preds = outputs.logits.argmax(dim=-1)
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
